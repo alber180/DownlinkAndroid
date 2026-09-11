@@ -1,0 +1,908 @@
+import express from 'express';
+import cors from 'cors';
+import { spawn } from 'child_process';
+import { v4 as uuidv4 } from 'uuid';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
+import { createRequire } from 'module';
+import { PlatformRegistry } from './server/platforms/common/platform-registry.js';
+import { YouTubeProvider } from './server/platforms/youtube/youtube-provider.js';
+import { XProvider } from './server/platforms/x/x-provider.js';
+import { InstagramProvider } from './server/platforms/instagram/instagram-provider.js';
+import { getInstagramStorySource, isValidInstagramStoryVideoId } from './shared/instagram-stories.js';
+import {
+  parseInstagramStoryVideos, selectInstagramStory, storyUnavailableError, getInstagramStoryError,
+} from './server/platforms/instagram/instagram-stories.js';
+import { TikTokProvider } from './server/platforms/tiktok/tiktok-provider.js';
+import { RedditProvider } from './server/platforms/reddit/reddit-provider.js';
+import { TwitchProvider } from './server/platforms/twitch/twitch-provider.js';
+import {
+  parseVideoInfoCollection,
+  getVideoDuration,
+  getVideoFormats,
+  getViewCount
+} from './server/platforms/common/video-metadata.js';
+import { formatDownloadProgress } from './server/download-progress.js';
+import { getYtDlpInfoOutput } from './server/yt-dlp-result.js';
+import { createInstagramAuth } from './server/instagram-auth.js';
+import { MP3_QUALITIES, getMp3BitrateFromQuality } from './shared/mp3-qualities.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
+const bundledFfmpegPath = require('ffmpeg-static');
+const bundledFfprobePath = require('ffprobe-static').path;
+
+// yt-dlp se guarda junto a la aplicación para que Windows no dependa de PATH.
+// Se puede sustituir con YT_DLP_PATH si ya existe una instalación administrada.
+const BIN_DIR = path.join(__dirname, 'bin');
+const ytDlpFileName = process.platform === 'win32'
+  ? 'yt-dlp.exe'
+  : process.platform === 'darwin'
+    ? 'yt-dlp_macos'
+    : 'yt-dlp';
+const LOCAL_YT_DLP_PATH = path.join(BIN_DIR, ytDlpFileName);
+const LOCAL_FFMPEG_PATH = path.join(BIN_DIR, path.basename(bundledFfmpegPath));
+const LOCAL_FFPROBE_PATH = path.join(BIN_DIR, path.basename(bundledFfprobePath));
+let ytDlpDownloadPromise = null;
+const platformRegistry = new PlatformRegistry([
+  new YouTubeProvider(),
+  new XProvider(),
+  // Account cookies belong to the connected browser, never to a shared provider.
+  new InstagramProvider({ cookiesFile: '' }),
+  new TikTokProvider(),
+  new RedditProvider(),
+  new TwitchProvider()
+]);
+const INFO_CACHE_TTL_MS = 10 * 60 * 1000;
+const INFO_CACHE_MAX_ENTRIES = 100;
+const infoCache = new Map();
+const pendingInfoRequests = new Map();
+const protectedProcesses = new Map();
+
+function getFfmpegLocation() {
+  if (fs.existsSync(LOCAL_FFMPEG_PATH) && fs.existsSync(LOCAL_FFPROBE_PATH)) {
+    return BIN_DIR;
+  }
+
+  if (!bundledFfmpegPath || !bundledFfprobePath || !fs.existsSync(bundledFfmpegPath) || !fs.existsSync(bundledFfprobePath)) {
+    throw new Error('No se encontraron las herramientas de conversión. Ejecuta npm install para instalarlas.');
+  }
+
+  fs.mkdirSync(BIN_DIR, { recursive: true });
+  fs.copyFileSync(bundledFfmpegPath, LOCAL_FFMPEG_PATH);
+  fs.copyFileSync(bundledFfprobePath, LOCAL_FFPROBE_PATH);
+  console.log(`ffmpeg y ffprobe preparados en ${BIN_DIR}`);
+  return BIN_DIR;
+}
+
+async function getYtDlpExecutable() {
+  if (process.env.YT_DLP_PATH) {
+    return process.env.YT_DLP_PATH;
+  }
+
+  if (fs.existsSync(LOCAL_YT_DLP_PATH)) {
+    return LOCAL_YT_DLP_PATH;
+  }
+
+  if (!ytDlpDownloadPromise) {
+    ytDlpDownloadPromise = downloadYtDlp();
+  }
+
+  return ytDlpDownloadPromise;
+}
+
+async function warmYtDlp() {
+  try {
+    const executable = await getYtDlpExecutable();
+    const proc = spawn(executable, ['--version'], {
+      windowsHide: true,
+      stdio: 'ignore'
+    });
+    proc.on('error', () => {});
+  } catch (err) {
+    console.warn(`No se pudo preparar yt-dlp al iniciar: ${err.message}`);
+  }
+}
+
+async function downloadYtDlp() {
+  fs.mkdirSync(BIN_DIR, { recursive: true });
+  const temporaryPath = `${LOCAL_YT_DLP_PATH}.${process.pid}.download`;
+  const downloadUrl = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${ytDlpFileName}`;
+
+  try {
+    console.log('yt-dlp no está instalado. Descargando una copia local...');
+    const response = await fetch(downloadUrl);
+
+    if (!response.ok || !response.body) {
+      throw new Error(`la descarga devolvió HTTP ${response.status}`);
+    }
+
+    await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(temporaryPath));
+    fs.renameSync(temporaryPath, LOCAL_YT_DLP_PATH);
+
+    if (process.platform !== 'win32') {
+      fs.chmodSync(LOCAL_YT_DLP_PATH, 0o755);
+    }
+
+    console.log(`yt-dlp preparado en ${LOCAL_YT_DLP_PATH}`);
+    return LOCAL_YT_DLP_PATH;
+  } catch (err) {
+    try { fs.rmSync(temporaryPath, { force: true }); } catch { /* ignore */ }
+    ytDlpDownloadPromise = null;
+    throw new Error(
+      `No se pudo instalar yt-dlp automáticamente (${err.message}). ` +
+      'Comprueba tu conexión o instala yt-dlp y define la variable YT_DLP_PATH.'
+    );
+  }
+}
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+const instagramAuth = createInstagramAuth({ notifyRevoke: revokeInstagramConnection });
+
+// Carpeta temporal para descargas
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+if (!fs.existsSync(DOWNLOADS_DIR)) {
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+}
+
+app.use(express.json());
+app.use('/api', instagramAuth.middleware);
+app.use('/api/instagram', instagramAuth.router);
+app.use(cors());
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/media', express.static(path.join(__dirname, 'media')));
+app.use('/shared', express.static(path.join(__dirname, 'shared')));
+
+// ─── In-memory Job Store ────────────────────────────────────────────────────────
+const jobs = new Map();
+
+function assertInstagramConnection(context) {
+  if (context && !instagramAuth.isCurrent(context)) {
+    throw Object.assign(new Error('La sesión de Instagram ha caducado o se ha desconectado. Vuelve a conectar tu cuenta.'), {
+      code: 'INSTAGRAM_SESSION_EXPIRED', status: 401,
+    });
+  }
+}
+
+function trackProtectedProcess(context, process) {
+  if (!context) return;
+  if (!protectedProcesses.has(context.key)) protectedProcesses.set(context.key, new Set());
+  const processes = protectedProcesses.get(context.key);
+  processes.add(process);
+  const remove = () => {
+    processes.delete(process);
+    if (!processes.size) protectedProcesses.delete(context.key);
+  };
+  process.once('close', remove);
+  process.once('error', remove);
+  if (!instagramAuth.isCurrent(context)) void terminateConverter(process);
+}
+
+function terminateConverter(child) {
+  if (child.exitCode !== null && child.exitCode !== undefined) return Promise.resolve();
+  if (process.platform === 'win32' && Number.isInteger(child.pid) && child.pid > 0) {
+    // Only PIDs returned by our own spawn calls are registered here. Kill ffmpeg
+    // descendants too, so a cancelled conversion cannot recreate private files.
+    return new Promise(resolve => {
+      const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      killer.once('close', () => resolve());
+      killer.once('error', () => { child.kill(); resolve(); });
+    });
+  }
+  try {
+    if (Number.isInteger(child.pid) && process.platform !== 'win32') process.kill(-child.pid, 'SIGTERM');
+    else child.kill();
+  } catch { /* Process already finished. */ }
+  return Promise.resolve();
+}
+
+function removeJobFiles(job) {
+  for (const file of fs.readdirSync(DOWNLOADS_DIR)) {
+    if (file.startsWith(`${job.id}.`)) {
+      try { fs.unlinkSync(path.join(DOWNLOADS_DIR, file)); } catch { /* A closing stream may still hold the file. */ }
+    }
+  }
+}
+
+async function revokeInstagramConnection(context) {
+  const terminating = [...(protectedProcesses.get(context.key) || [])].map(terminateConverter);
+  const revokedJobs = [];
+  for (const [id, job] of jobs) {
+    if (job.instagramContext?.key !== context.key) continue;
+    job.revoked = true;
+    revokedJobs.push(job);
+    for (const stream of job.streams || []) stream.destroy();
+    removeJobFiles(job);
+    jobs.delete(id);
+  }
+  await Promise.allSettled(terminating);
+  for (const job of revokedJobs) removeJobFiles(job);
+}
+
+function canReadJob(req, job) {
+  if (!job.instagramContext) return true;
+  const current = instagramAuth.getContext(req);
+  return current?.key === job.instagramContext.key && instagramAuth.isCurrent(current);
+}
+
+function formatDuration(seconds) {
+  const totalSeconds = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainingSeconds = totalSeconds % 60;
+  const paddedSeconds = String(remainingSeconds).padStart(2, '0');
+
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${paddedSeconds}`
+    : `${minutes}:${paddedSeconds}`;
+}
+
+// ─── Ejecutar yt-dlp como promesa (para info) ──────────────────────────────────
+async function runYtDlp(args, options = {}) {
+  const executable = await getYtDlpExecutable();
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(executable, args, { windowsHide: true, detached: Boolean(options.instagramContext) && process.platform !== 'win32' });
+    trackProtectedProcess(options.instagramContext, proc);
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    proc.on('close', (code) => {
+      try {
+        resolve(getYtDlpInfoOutput({ code, stdout, stderr }, options));
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    proc.on('error', (err) => {
+      reject(new Error(`No se pudo iniciar yt-dlp: ${err.message}`));
+    });
+  });
+}
+
+function getInfoCacheKey(provider, url) {
+  return `${provider.name}:${provider.normalizeUrl(url)}`;
+}
+
+function readCachedInfo(cacheKey) {
+  const cached = infoCache.get(cacheKey);
+  if (!cached) return null;
+
+  if (cached.expiresAt <= Date.now()) {
+    infoCache.delete(cacheKey);
+    return null;
+  }
+
+  // Refresh insertion order so the size limit behaves like a small LRU cache.
+  infoCache.delete(cacheKey);
+  infoCache.set(cacheKey, cached);
+  return cached.value;
+}
+
+function cacheInfo(cacheKey, value, ttl = INFO_CACHE_TTL_MS) {
+  infoCache.set(cacheKey, {
+    value,
+    expiresAt: Date.now() + ttl
+  });
+
+  while (infoCache.size > INFO_CACHE_MAX_ENTRIES) {
+    infoCache.delete(infoCache.keys().next().value);
+  }
+}
+
+async function getVideoInfo(provider, url, instagramContext = null) {
+  assertInstagramConnection(instagramContext);
+  const normalizedUrl = provider.normalizeUrl(url);
+  const storySource = provider.name === 'instagram' ? getInstagramStorySource(normalizedUrl) : null;
+  const cacheKey = getInfoCacheKey(provider, normalizedUrl);
+  const cached = instagramContext ? null : readCachedInfo(cacheKey);
+  if (cached) return cached;
+
+  const pending = instagramContext ? null : pendingInfoRequests.get(cacheKey);
+  if (pending) return pending;
+
+  const request = (async () => {
+    const extract = extractionProvider => runYtDlp([
+      '--dump-single-json',
+      '--no-playlist',
+      '--no-warnings',
+      ...extractionProvider.getInfoYtDlpArgs({ url: normalizedUrl }),
+      normalizedUrl
+    ], { allowPartialPlaylist: provider.name === 'instagram' && !storySource, instagramContext });
+    const raw = instagramContext
+      ? await instagramAuth.withCookieFile(instagramContext, cookiesFile => extract(new InstagramProvider({ cookiesFile })))
+      : await extract(provider);
+    assertInstagramConnection(instagramContext);
+    const parsedVideos = storySource ? parseInstagramStoryVideos(raw) : parseVideoInfoCollection(raw);
+    const extractedVideos = instagramContext ? parsedVideos : await provider.enrichVideoInfos(parsedVideos, { url: normalizedUrl });
+    const videos = extractedVideos.map((info, index) => {
+      const duration = getVideoDuration(info);
+      const playlistItem = Number(info.playlist_index);
+      return {
+        id: info.id || null,
+        playlistItem: Number.isInteger(playlistItem) && playlistItem > 0 ? playlistItem : index + 1,
+        title: storySource?.username ? `Story de @${storySource.username}` : (info.title || 'Sin título'),
+        thumbnail: info.thumbnail || '',
+        duration,
+        duration_string: duration !== null ? formatDuration(duration) : (info.duration_string || ''),
+        channel: info.channel || info.uploader || 'Desconocido',
+        view_count: getViewCount(info),
+        videoFormats: getVideoFormats(info)
+      };
+    });
+    const firstVideo = videos[0];
+    const value = {
+      ...firstVideo,
+      platform: provider.name,
+      ...(storySource ? { contentType: 'instagram-story' } : {}),
+      videos: videos.length > 1 ? videos : [],
+      videoCount: videos.length,
+      audioQualities: MP3_QUALITIES
+    };
+
+    // Active stories can expire or be added while a profile is open.
+    // Authenticated metadata never enters the shared cache or request pool.
+    if (!instagramContext) cacheInfo(cacheKey, value, storySource ? 30_000 : INFO_CACHE_TTL_MS);
+    return value;
+  })();
+
+  if (instagramContext) return request;
+  pendingInfoRequests.set(cacheKey, request);
+  try {
+    return await request;
+  } finally {
+    if (pendingInfoRequests.get(cacheKey) === request) {
+      pendingInfoRequests.delete(cacheKey);
+    }
+  }
+}
+
+// ─── POST /api/info — Obtener metadata del video ───────────────────────────────
+app.post('/api/info', async (req, res) => {
+  try {
+    const { url } = req.body;
+
+    const provider = platformRegistry.findByUrl(url);
+    if (!provider) {
+      return res.status(400).json({ error: 'URL de YouTube, X, Instagram, TikTok, Reddit o Twitch no válida' });
+    }
+
+    const context = provider.name === 'instagram' ? instagramAuth.getContext(req) : null;
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(await getVideoInfo(provider, url, context));
+  } catch (err) {
+    console.error('Error fetching info:', instagramAuth.getContext(req) ? (err.code || 'Instagram extraction failed') : err.message);
+    if (err.code === 'INSTAGRAM_SESSION_EXPIRED') {
+      return res.status(401).json({ code: err.code, error: err.message });
+    }
+    if (getInstagramStorySource(req.body?.url)) {
+      const { status, ...body } = getInstagramStoryError(err);
+      return res.status(status).json(body);
+    }
+    res.status(500).json({ error: 'No se pudo obtener el vídeo. Comprueba que el enlace sea público y esté disponible.' });
+  }
+});
+
+// ─── POST /api/download — Iniciar descarga en background ───────────────────────
+app.post('/api/download', async (req, res) => {
+  const { url, format, quality, playlistItem, videoId } = req.body;
+
+  const provider = platformRegistry.findByUrl(url);
+  if (!provider) {
+    return res.status(400).json({ error: 'URL de YouTube, X, Instagram, TikTok, Reddit o Twitch no válida' });
+  }
+
+  if (!format || !['mp3', 'mp4'].includes(format)) {
+    return res.status(400).json({ error: 'Formato no válido. Usa mp3 o mp4.' });
+  }
+
+  const storySource = provider.name === 'instagram' ? getInstagramStorySource(url) : null;
+  if (storySource && !isValidInstagramStoryVideoId(videoId)) {
+    return res.status(400).json({ error: 'Selecciona una story válida antes de descargar.' });
+  }
+
+  const selectedQuality = String(quality ?? (format === 'mp3' ? '0' : 'best'));
+  const validQuality = format === 'mp3'
+    ? /^[0-9]$/.test(selectedQuality)
+    : selectedQuality === 'best' || /^[1-9]\d{0,4}$/.test(selectedQuality);
+  if (!validQuality) {
+    return res.status(400).json({ error: 'Calidad no válida para el formato seleccionado.' });
+  }
+
+  const selectedPlaylistItem = playlistItem === null || playlistItem === undefined
+    ? null
+    : Number(playlistItem);
+  if (selectedPlaylistItem !== null && (
+    provider.name !== 'instagram'
+    || !Number.isInteger(selectedPlaylistItem)
+    || selectedPlaylistItem < 1
+    || selectedPlaylistItem > 1000
+  )) {
+    return res.status(400).json({ error: 'Elemento del carrusel no válido.' });
+  }
+
+  const jobId = uuidv4();
+
+  const job = {
+    id: jobId,
+    status: 'starting',
+    progress: '0%',
+    progressDetail: 'Analizando el vídeo...',
+    format,
+    quality: selectedQuality,
+    playlistItem: selectedPlaylistItem,
+    videoId: storySource ? videoId : null,
+    isInstagramStory: Boolean(storySource),
+    instagramContext: provider.name === 'instagram' ? instagramAuth.getContext(req) : null,
+    url: provider.normalizeUrl(url),
+    filename: null,
+    filePath: null,
+    error: null,
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    process: null
+  };
+
+  jobs.set(jobId, job);
+
+  // Responder inmediatamente con el jobId
+  res.json({ jobId });
+
+  // Iniciar descarga en background
+  startDownloadJob(job);
+});
+
+// ─── Background download worker ────────────────────────────────────────────────
+async function startDownloadJob(job) {
+  try {
+    if (job.instagramContext) {
+      await instagramAuth.withCookieFile(job.instagramContext, cookiesFile => performDownloadJob(job, new InstagramProvider({ cookiesFile })));
+    } else {
+      await performDownloadJob(job, platformRegistry.findByUrl(job.url));
+    }
+  } catch (error) {
+    failDownloadJob(job, error);
+  }
+}
+
+async function performDownloadJob(job, provider) {
+  try {
+    // 1. Obtener título
+    console.log(`[Job ${job.id.slice(0, 8)}] Starting: format=${job.format}, quality=${job.quality}`);
+    assertInstagramConnection(job.instagramContext);
+    const info = await getVideoInfo(provider, job.url, job.instagramContext);
+    const selectedVideoIndex = Array.isArray(info.videos)
+      ? info.videos.findIndex(video => video.playlistItem === job.playlistItem)
+      : -1;
+    const selectedVideo = job.isInstagramStory
+      ? selectInstagramStory(info, job.videoId)
+      : (selectedVideoIndex >= 0 ? info.videos[selectedVideoIndex] : info);
+    const providerArgs = provider.getYtDlpArgs({
+      url: job.url, videoId: job.videoId, playlistItem: job.playlistItem ?? 1,
+    });
+    const carouselSuffix = job.isInstagramStory
+      ? ` - ${job.videoId}`
+      : (selectedVideoIndex >= 0 ? ` - Vídeo ${selectedVideoIndex + 1}` : '');
+    const safeTitle = `${selectedVideo.title || 'video'}${carouselSuffix}`
+      .replace(/[<>:"/\\|?*]/g, '_')
+      .substring(0, 100);
+
+    job.filename = `${safeTitle}.${job.format}`;
+    job.status = 'downloading';
+    job.progressDetail = 'Preparando archivo...';
+
+    // 2. Construir argumentos de yt-dlp
+    const ffmpegLocation = getFfmpegLocation();
+    const executable = await getYtDlpExecutable();
+
+    let ytArgs;
+    let tempAudioPath = null;
+    let finalFilePath = path.join(DOWNLOADS_DIR, `${job.id}.%(ext)s`);
+
+    if (job.format === 'mp3') {
+      const bitrate = getMp3BitrateFromQuality(job.quality);
+      tempAudioPath = path.join(DOWNLOADS_DIR, `${job.id}.audio.%(ext)s`);
+      ytArgs = [
+        '-f', 'bestaudio/best',
+        '--no-playlist',
+        '--no-warnings',
+        '--newline',
+        '--ffmpeg-location', ffmpegLocation,
+        '-o', tempAudioPath,
+        ...providerArgs,
+        job.url
+      ];
+
+      finalFilePath = path.join(DOWNLOADS_DIR, `${job.id}.mp3`);
+
+      console.log(`[Job ${job.id.slice(0, 8)}] Preparing MP3 (bitrate ${bitrate}k)`);
+
+      await new Promise((resolve, reject) => {
+        const proc = spawn(executable, ytArgs, { windowsHide: true, detached: Boolean(job.instagramContext) && process.platform !== 'win32' });
+        trackProtectedProcess(job.instagramContext, proc);
+        job.process = proc;
+        let stderr = '';
+
+        proc.stdout.on('data', (data) => {
+          const lines = data.toString().split('\n');
+          for (const line of lines) {
+            parseProgress(job, line);
+          }
+        });
+
+        proc.stderr.on('data', (data) => {
+          stderr += data.toString();
+          const lines = data.toString().split('\n');
+          for (const line of lines) {
+            parseProgress(job, line);
+          }
+        });
+
+        proc.on('close', (code) => {
+          job.process = null;
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
+          }
+        });
+
+        proc.on('error', (err) => {
+          job.process = null;
+          reject(new Error(`No se pudo iniciar yt-dlp: ${err.message}`));
+        });
+      });
+
+      const tempFiles = fs.readdirSync(DOWNLOADS_DIR).filter(f => f.startsWith(`${job.id}.audio.`));
+      const downloadedAudio = tempFiles.find(f => ['.m4a', '.webm', '.mp4', '.aac', '.opus', '.mp3', '.wav', '.flac', '.ogg'].includes(path.extname(f).toLowerCase()));
+
+      if (!downloadedAudio) {
+        if (job.isInstagramStory) throw storyUnavailableError();
+        throw new Error('No se pudo obtener el audio base para convertir a MP3');
+      }
+
+      const audioInputPath = path.join(DOWNLOADS_DIR, downloadedAudio);
+      const ffmpegExecutable = path.join(BIN_DIR, path.basename(bundledFfmpegPath));
+
+      console.log(`[Job ${job.id.slice(0, 8)}] Converting to MP3 with FFmpeg: ${ffmpegExecutable} -i ${audioInputPath} -c:a libmp3lame -b:a ${bitrate}k ${finalFilePath}`);
+
+      await new Promise((resolve, reject) => {
+        const ffmpeg = spawn(ffmpegExecutable, [
+          '-hide_banner',
+          '-loglevel', 'error',
+          '-i', audioInputPath,
+          '-vn',
+          '-c:a', 'libmp3lame',
+          '-b:a', `${bitrate}k`,
+          '-ar', '44100',
+          '-ac', '2',
+          finalFilePath
+        ], { windowsHide: true, detached: Boolean(job.instagramContext) && process.platform !== 'win32' });
+
+        job.process = ffmpeg;
+        trackProtectedProcess(job.instagramContext, ffmpeg);
+        let stderr = '';
+
+        ffmpeg.stderr.on('data', (data) => {
+          stderr += data.toString();
+          const lines = data.toString().split('\n');
+          for (const line of lines) {
+            parseProgress(job, line);
+          }
+        });
+
+        ffmpeg.on('close', (code) => {
+          job.process = null;
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
+          }
+        });
+
+        ffmpeg.on('error', (err) => {
+          job.process = null;
+          reject(new Error(`No se pudo iniciar ffmpeg: ${err.message}`));
+        });
+      });
+
+      try { fs.unlinkSync(audioInputPath); } catch (e) { /* ignore */ }
+      job.filePath = finalFilePath;
+      job.finalExtension = '.mp3';
+      job.filename = `${safeTitle}.mp3`;
+    } else {
+      const heightFilter = job.quality === 'best' ? '' : `[height<=${job.quality}]`;
+      ytArgs = [
+        '-f', `bestvideo${heightFilter}+bestaudio/best${heightFilter}/bestvideo${heightFilter}/best`,
+        '--merge-output-format', 'mp4',
+        '--recode-video', 'mp4',
+        '--no-playlist',
+        '--no-warnings',
+        '--newline',
+        '--ffmpeg-location', ffmpegLocation,
+        '-o', finalFilePath,
+        ...providerArgs,
+        job.url
+      ];
+
+      console.log(`[Job ${job.id.slice(0, 8)}] Preparing MP4`);
+
+      await new Promise((resolve, reject) => {
+        const proc = spawn(executable, ytArgs, { windowsHide: true, detached: Boolean(job.instagramContext) && process.platform !== 'win32' });
+        trackProtectedProcess(job.instagramContext, proc);
+        job.process = proc;
+        let stderr = '';
+
+        proc.stdout.on('data', (data) => {
+          const lines = data.toString().split('\n');
+          for (const line of lines) {
+            parseProgress(job, line);
+          }
+        });
+
+        proc.stderr.on('data', (data) => {
+          stderr += data.toString();
+          const lines = data.toString().split('\n');
+          for (const line of lines) {
+            parseProgress(job, line);
+          }
+        });
+
+        proc.on('close', (code) => {
+          job.process = null;
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
+          }
+        });
+
+        proc.on('error', (err) => {
+          job.process = null;
+          reject(new Error(`No se pudo iniciar yt-dlp: ${err.message}`));
+        });
+      });
+
+      job.filePath = path.join(DOWNLOADS_DIR, `${job.id}.mp4`);
+      if (!fs.existsSync(job.filePath)) {
+        if (job.isInstagramStory) throw storyUnavailableError();
+        throw new Error('No se pudo generar el archivo MP4.');
+      }
+      job.finalExtension = '.mp4';
+      job.filename = `${safeTitle}.mp4`;
+    }
+    
+    assertInstagramConnection(job.instagramContext);
+    const stat = fs.statSync(job.filePath);
+    const sizeMB = (stat.size / (1024 * 1024)).toFixed(1);
+
+    job.status = 'ready';
+    job.progress = '100%';
+    job.progressDetail = `Listo — ${sizeMB} MB`;
+    console.log(`[Job ${job.id.slice(0, 8)}] Completed: ${job.filename} (${sizeMB} MB)`);
+
+  } catch (err) {
+    failDownloadJob(job, err);
+  }
+}
+
+function failDownloadJob(job, err) {
+  console.error(`[Job ${job.id.slice(0, 8)}] Error:`, job.instagramContext ? (err.code || 'Instagram download failed') : err.message);
+  job.status = 'error';
+  job.error = err.code === 'INSTAGRAM_SESSION_EXPIRED' ? err.message : (job.isInstagramStory || job.instagramContext)
+    ? getInstagramStoryError(err).error
+    : (err.message || 'Error al descargar. Verifica que yt-dlp y ffmpeg estén instalados.');
+  job.process = null;
+
+  // Limpiar archivos parciales
+  try { removeJobFiles(job); } catch { /* ignore */ }
+}
+
+// ─── Parsear progreso de yt-dlp ─────────────────────────────────────────────────
+function parseProgress(job, line) {
+  if (!line || !line.trim()) return;
+  job.lastActivity = Date.now();
+
+  // [download]  45.3% of ~120.5MiB at  5.2MiB/s ETA 00:15
+  const dlMatch = line.match(/\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+\S+)\s+at\s+([\d.]+\S+)\s+ETA\s+(\S+)/);
+  if (dlMatch) {
+    job.progress = `${parseFloat(dlMatch[1]).toFixed(0)}%`;
+    const speed = dlMatch[3];
+    const eta = dlMatch[4];
+    job.progressDetail = formatDownloadProgress(speed, eta);
+    return;
+  }
+
+  // Simpler progress pattern: [download]  45.3% of ~120.5MiB
+  const simpleMatch = line.match(/\[download\]\s+([\d.]+)%/);
+  if (simpleMatch) {
+    job.progress = `${parseFloat(simpleMatch[1]).toFixed(0)}%`;
+    job.progressDetail = 'Preparando archivo';
+    return;
+  }
+
+  // [download] Destination: filename
+  if (line.includes('[download] Destination:')) {
+    job.status = 'downloading';
+    job.progressDetail = 'Preparando archivo...';
+    return;
+  }
+
+  // [Merger] Merging formats
+  if (line.includes('[Merger]') || line.includes('Merging formats')) {
+    job.status = 'converting';
+    job.progress = '99%';
+    job.progressDetail = 'Uniendo vídeo y audio...';
+    return;
+  }
+
+  // [ExtractAudio] or [ffmpeg] Converting
+  if (line.includes('[ExtractAudio]') || line.includes('Converting')) {
+    job.status = 'converting';
+    job.progress = '95%';
+    job.progressDetail = 'Convirtiendo a ' + job.format.toUpperCase() + '...';
+    return;
+  }
+
+  // Already downloaded
+  if (line.includes('has already been downloaded')) {
+    job.progress = '100%';
+    job.progressDetail = 'Archivo preparado';
+    return;
+  }
+}
+
+// ─── GET /api/status/:jobId — Consultar estado del job ──────────────────────────
+app.get('/api/status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job || !canReadJob(req, job)) {
+    return res.status(404).json({ error: 'Job no encontrado' });
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    status: job.status,
+    progress: job.progress,
+    progressDetail: job.progressDetail,
+    filename: job.filename,
+    format: job.format,
+    error: job.error
+  });
+});
+
+// ─── GET /api/file/:jobId — Descargar el archivo completado ─────────────────────
+app.get('/api/file/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job || !canReadJob(req, job)) {
+    return res.status(404).json({ error: 'Job no encontrado' });
+  }
+
+  if (job.status !== 'ready' || !job.filePath) {
+    return res.status(400).json({ error: 'Archivo no está listo todavía' });
+  }
+
+  if (!fs.existsSync(job.filePath)) {
+    job.status = 'error';
+    job.error = 'Archivo no encontrado en disco';
+    return res.status(404).json({ error: 'Archivo no encontrado' });
+  }
+
+  try {
+    const stat = fs.statSync(job.filePath);
+    const ext = job.finalExtension || `.${job.format}`;
+    
+    let mimeType = 'application/octet-stream';
+    if (ext === '.mp3') mimeType = 'audio/mpeg';
+    else if (ext === '.mp4') mimeType = 'video/mp4';
+    else if (ext === '.mkv') mimeType = 'video/x-matroska';
+    else if (ext === '.webm') mimeType = 'video/webm';
+    else if (ext === '.m4a') mimeType = 'audio/mp4';
+
+    const safeFilename = encodeURIComponent(job.filename || `download${ext}`);
+
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${safeFilename}`);
+
+    const stream = fs.createReadStream(job.filePath);
+    job.streams ||= new Set();
+    job.streams.add(stream);
+    stream.once('close', () => {
+      job.streams.delete(stream);
+      if (job.revoked) {
+        res.destroy();
+        removeJobFiles(job);
+      }
+    });
+    res.once('close', () => stream.destroy());
+    stream.pipe(res);
+
+    stream.on('end', () => {
+      // Limpiar después de que el usuario descargue
+      setTimeout(() => {
+        try {
+          if (fs.existsSync(job.filePath)) {
+            fs.unlinkSync(job.filePath);
+            console.log(`[Job ${job.id.slice(0, 8)}] File cleaned up`);
+          }
+        } catch (e) { /* ignore */ }
+        jobs.delete(job.id);
+      }, 30000); // Esperar 30s por si descarga de nuevo
+    });
+
+    stream.on('error', (err) => {
+      console.error('Stream error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al enviar archivo' });
+      }
+    });
+
+  } catch (err) {
+    console.error('File serve error:', err);
+    res.status(500).json({ error: 'Error al servir el archivo' });
+  }
+});
+
+// ─── Limpieza periódica ─────────────────────────────────────────────────────────
+setInterval(() => {
+  const now = Date.now();
+
+  // Limpiar jobs viejos (>4 horas)
+  for (const [id, job] of jobs) {
+    if (now - job.lastActivity > 240 * 60 * 1000) {
+      if (job.filePath && fs.existsSync(job.filePath)) {
+        try { fs.unlinkSync(job.filePath); } catch (e) { /* ignore */ }
+      }
+      jobs.delete(id);
+      console.log(`[Cleanup] Deleted old job: ${id.slice(0, 8)}`);
+    }
+  }
+
+  // Limpiar archivos huérfanos en downloads/ (>4 horas)
+  try {
+    const files = fs.readdirSync(DOWNLOADS_DIR);
+    for (const file of files) {
+      const filePath = path.join(DOWNLOADS_DIR, file);
+      const stat = fs.statSync(filePath);
+      if (now - stat.mtimeMs > 240 * 60 * 1000) {
+        fs.unlinkSync(filePath);
+        console.log(`[Cleanup] Deleted orphan file: ${file}`);
+      }
+    }
+  } catch (e) { /* ignore */ }
+}, 10 * 60 * 1000); // Cada 10 min
+
+// ─── Iniciar servidor ───────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  // Prepare/download the extractor before the first user submits a link.
+  void warmYtDlp();
+  console.log('');
+  console.log('  ▶️ ══════════════════════════════════════════ ▶️');
+  console.log('  ║                                              ║');
+  console.log('  ║              DOWNLINK v1.2                   ║');
+  console.log('  ║ YouTube · X · Instagram · TikTok · Reddit · Twitch ║');
+  console.log('  ║               MP3 / MP4                     ║');
+  console.log('  ║                                              ║');
+  console.log(`  ║   🚀  http://localhost:${PORT}                  ║`);
+  console.log('  ║                                              ║');
+  console.log('  ▶️ ══════════════════════════════════════════ ▶️');
+  console.log('');
+});
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    void instagramAuth.dispose().finally(() => process.exit(0));
+  });
+}

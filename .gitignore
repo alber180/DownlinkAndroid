@@ -1,0 +1,9 @@
+node_modules/
+bin/
+downloads/
+secrets/
+*.cookies.txt
+cookies.txt
+.env
+.env.*
+!.env.example
